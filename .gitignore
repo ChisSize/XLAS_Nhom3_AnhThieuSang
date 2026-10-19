@@ -5,3 +5,8 @@ venv/
 data/raw/
 data/processed/
 .vscode/
+.vs/
+*.user
+*.suo
+*.userosv
+*.sln.docstates
