@@ -37,6 +37,15 @@ RANDOM_SEED = 42
 
 METHODS = ["Gaussian", "Median", "Bilateral"]
 
+# --- Giảm dung lượng ảnh đầu ra ---
+SAVE_FORMAT = ".jpg"     # ".jpg" nhẹ nhất | ".png" nặng hơn nhiều
+JPEG_QUALITY = 80        # 60-95, càng thấp càng nhẹ
+PNG_COMPRESSION = 9      # 0-9, chỉ dùng khi SAVE_FORMAT = ".png"
+MAX_SIDE = 1024          # thu nhỏ nếu cạnh dài hơn số này (None = giữ nguyên)
+
+# Cảnh báo nếu tổng dung lượng vượt ngưỡng này (MB)
+WARN_TOTAL_MB = 25
+
 
 # =========================================================
 # 2. LẤY DANH SÁCH ẢNH
@@ -76,7 +85,7 @@ def split_among_methods(image_paths):
 
 
 # =========================================================
-# 4. KHỬ NHIỄU
+# 4. KHỬ NHIỄU + LƯU ẢNH NHẸ
 # =========================================================
 
 def denoise(image, method):
@@ -94,32 +103,65 @@ def denoise(image, method):
     raise ValueError(f"Phương pháp không hợp lệ: {method}")
 
 
+def resize_if_needed(image):
+    if MAX_SIDE is None:
+        return image
+    h, w = image.shape[:2]
+    scale = MAX_SIDE / max(h, w)
+    if scale >= 1:
+        return image
+    return cv2.resize(
+        image,
+        (int(w * scale), int(h * scale)),
+        interpolation=cv2.INTER_AREA,
+    )
+
+
 def process_image(image_path, method):
     image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if image is None:
         print(f"Không đọc được ảnh: {image_path}")
         return False
 
+    # Khử nhiễu ở kích thước gốc, rồi mới thu nhỏ khi lưu
+    result = resize_if_needed(denoise(image, method))
+
     relative_path = image_path.relative_to(SRC_DIR)
-    save_path = OUTPUT_DIR / method / relative_path
+    save_path = (OUTPUT_DIR / method / relative_path).with_suffix(SAVE_FORMAT)
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
-    result = denoise(image, method)
+    if SAVE_FORMAT.lower() in (".jpg", ".jpeg"):
+        params = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+    else:
+        params = [cv2.IMWRITE_PNG_COMPRESSION, PNG_COMPRESSION]
 
-    if not cv2.imwrite(str(save_path), result):
+    if not cv2.imwrite(str(save_path), result, params):
         print(f"Lỗi lưu ảnh: {save_path}")
         return False
     return True
 
 
 # =========================================================
-# 5. CHẠY
+# 5. TÍNH DUNG LƯỢNG
+# =========================================================
+
+def folder_size_mb(folder):
+    folder = Path(folder)
+    if not folder.exists():
+        return 0.0
+    total = sum(p.stat().st_size for p in folder.rglob("*") if p.is_file())
+    return total / (1024 * 1024)
+
+
+# =========================================================
+# 6. CHẠY
 # =========================================================
 
 def main():
     print("=" * 60)
     print(f"Ảnh đầu vào: {SRC_DIR}")
     print(f"Ảnh đầu ra:  {OUTPUT_DIR}")
+    print(f"Định dạng lưu: {SAVE_FORMAT} | JPEG quality: {JPEG_QUALITY} | Cạnh dài tối đa: {MAX_SIDE}")
     print("=" * 60)
 
     if not SRC_DIR.is_dir():
@@ -132,6 +174,7 @@ def main():
         return
 
     print(f"Tổng số ảnh tìm thấy: {len(image_paths)}")
+    print(f"Dung lượng ảnh đầu vào: {folder_size_mb(SRC_DIR):.1f} MB")
 
     if RESET_OUTPUT and OUTPUT_DIR.exists():
         print(f"Đang xóa kết quả cũ: {OUTPUT_DIR}")
@@ -157,13 +200,20 @@ def main():
             else:
                 failed += 1
 
+    total_mb = folder_size_mb(OUTPUT_DIR)
+
     print("\n" + "=" * 60)
     print("HOÀN THÀNH")
     print("=" * 60)
     for method in METHODS:
-        print(f"{method}: {success[method]} ảnh")
+        print(f"{method}: {success[method]} ảnh | {folder_size_mb(OUTPUT_DIR / method):.1f} MB")
     print(f"Thất bại: {failed}")
     print(f"Tổng đã xử lý: {sum(success.values())} (mỗi ảnh chỉ 1 bộ lọc, không lặp)")
+    print(f"Tổng dung lượng kết quả: {total_mb:.1f} MB")
+
+    if total_mb > WARN_TOTAL_MB:
+        print(f"\nCẢNH BÁO: Tổng dung lượng vượt {WARN_TOTAL_MB} MB.")
+        print("Hãy giảm JPEG_QUALITY (ví dụ 70) hoặc MAX_SIDE (ví dụ 800) rồi chạy lại.")
 
 
 if __name__ == "__main__":
