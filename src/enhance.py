@@ -1,146 +1,220 @@
-"""
-Kỹ thuật cải thiện (phần của Trần Chí Vỹ):
-  1. Gamma correction
-  2. Giãn histogram theo percentile (mặc định 2–98%)
-  3. CLAHE (áp dụng trên kênh L của LAB để không làm lệch màu)
-
-Cách dùng:
-    from enhance_all import run_all_images
-    run_all_images("data/raw_images", "output", params={"gamma": 0.5})
-
-Kết quả:
-    output/gamma/      ảnh sau gamma
-    output/stretch/    ảnh sau giãn histogram
-    output/clahe/      ảnh sau CLAHE
-    output/pipeline/   ảnh sau cả 3 bước (gamma -> giãn -> CLAHE)
-    output/summary.csv bảng tham số và độ sáng trung bình trước/sau
-"""
-
+import random
+import shutil
 from pathlib import Path
-import csv
-import sys
+
 import cv2
-import numpy as np
-
-# Tham số mặc định. Có thể truyền dict khác vào run_all_images để ghi đè.
-DEFAULT_PARAMS = {
-    "gamma": 0.6,          # < 1 làm sáng vùng tối, > 1 làm tối
-    "low_pct": 2,          # percentile dưới cho giãn histogram
-    "high_pct": 98,        # percentile trên cho giãn histogram
-    "clahe_clip": 2.0,     # clipLimit của CLAHE
-    "clahe_grid": (8, 8),  # tileGridSize của CLAHE
-}
-
-IMG_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
 
-# ---------- đọc / ghi an toàn với đường dẫn tiếng Việt trên Windows ----------
-def read_image(path):
-    data = np.fromfile(str(path), dtype=np.uint8)
-    return cv2.imdecode(data, cv2.IMREAD_COLOR)
+# =========================================================
+# 1. CẤU HÌNH
+# =========================================================
+
+BASE_DIR = Path(
+    r"D:\XLAS\XLAS_Nhom3_AnhThieuSang-main"
+    r"\XLAS_Nhom3_AnhThieuSang-main"
+)
+
+SRC_DIR = BASE_DIR / "results" / "enhance" / "pipeline"   # ảnh đầu vào
+OUTPUT_DIR = BASE_DIR / "results" / "denoise"             # kết quả khử nhiễu
+
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+
+# Tham số các bộ lọc
+GAUSSIAN_KERNEL = (5, 5)
+GAUSSIAN_SIGMA = 1.0
+MEDIAN_KERNEL = 5
+BILATERAL_DIAMETER = 9
+BILATERAL_SIGMA_COLOR = 75
+BILATERAL_SIGMA_SPACE = 75
+
+# Số ảnh lấy ra để xử lý (None = lấy tất cả ảnh trong pipeline)
+NUM_IMAGES = None
+
+# True: xóa thư mục denoise cũ trước khi chạy (tránh ảnh cũ bị lẫn/lặp)
+RESET_OUTPUT = True
+
+RANDOM_SEED = 42
+
+METHODS = ["Gaussian", "Median", "Bilateral"]
+
+# --- Giảm dung lượng ảnh đầu ra ---
+SAVE_FORMAT = ".jpg"     # ".jpg" nhẹ nhất | ".png" nặng hơn nhiều
+JPEG_QUALITY = 80        # 60-95, càng thấp càng nhẹ
+PNG_COMPRESSION = 9      # 0-9, chỉ dùng khi SAVE_FORMAT = ".png"
+MAX_SIDE = 1024          # thu nhỏ nếu cạnh dài hơn số này (None = giữ nguyên)
+
+# Cảnh báo nếu tổng dung lượng vượt ngưỡng này (MB)
+WARN_TOTAL_MB = 25
 
 
-def write_image(path, img):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    ok, buf = cv2.imencode(path.suffix or ".png", img)
-    if not ok:
-        raise IOError(f"Không ghi được ảnh: {path}")
-    buf.tofile(str(path))
+# =========================================================
+# 2. LẤY DANH SÁCH ẢNH
+# =========================================================
+
+def get_image_paths(folder):
+    folder = Path(folder)
+    if not folder.exists():
+        return []
+    return sorted(
+        p for p in folder.rglob("*")
+        if p.is_file() and p.suffix.lower() in IMG_EXTS
+    )
 
 
-# ---------- 3 kỹ thuật ----------
-def gamma_correction(img, gamma):
-    table = np.array(
-        [((i / 255.0) ** gamma) * 255 for i in range(256)]
-    ).clip(0, 255).astype(np.uint8)
-    return cv2.LUT(img, table)
+# =========================================================
+# 3. CHIA ẢNH CHO 3 PHƯƠNG PHÁP (mỗi ảnh chỉ thuộc 1 phương pháp)
+# =========================================================
+
+def split_among_methods(image_paths):
+    paths = list(image_paths)
+    random.Random(RANDOM_SEED).shuffle(paths)
+
+    if NUM_IMAGES is not None:
+        paths = paths[:NUM_IMAGES]
+
+    base = len(paths) // len(METHODS)
+    remainder = len(paths) % len(METHODS)
+
+    groups = {}
+    start = 0
+    for i, method in enumerate(METHODS):
+        size = base + (1 if i < remainder else 0)
+        groups[method] = paths[start:start + size]
+        start += size
+    return groups
 
 
-def percentile_stretch(img, low_pct, high_pct):
-    out = np.empty_like(img)
-    for c in range(img.shape[2]):
-        channel = img[:, :, c].astype(np.float32)
-        lo = np.percentile(channel, low_pct)
-        hi = np.percentile(channel, high_pct)
-        if hi <= lo:  # ảnh phẳng, không giãn được
-            out[:, :, c] = img[:, :, c]
-            continue
-        stretched = (channel - lo) / (hi - lo) * 255.0
-        out[:, :, c] = np.clip(stretched, 0, 255).astype(np.uint8)
-    return out
+# =========================================================
+# 4. KHỬ NHIỄU + LƯU ẢNH NHẸ
+# =========================================================
+
+def denoise(image, method):
+    if method == "Gaussian":
+        return cv2.GaussianBlur(image, GAUSSIAN_KERNEL, sigmaX=GAUSSIAN_SIGMA)
+    if method == "Median":
+        return cv2.medianBlur(image, MEDIAN_KERNEL)
+    if method == "Bilateral":
+        return cv2.bilateralFilter(
+            image,
+            BILATERAL_DIAMETER,
+            BILATERAL_SIGMA_COLOR,
+            BILATERAL_SIGMA_SPACE,
+        )
+    raise ValueError(f"Phương pháp không hợp lệ: {method}")
 
 
-def clahe_lab(img, clip, grid):
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=tuple(grid))
-    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
-    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+def resize_if_needed(image):
+    if MAX_SIDE is None:
+        return image
+    h, w = image.shape[:2]
+    scale = MAX_SIDE / max(h, w)
+    if scale >= 1:
+        return image
+    return cv2.resize(
+        image,
+        (int(w * scale), int(h * scale)),
+        interpolation=cv2.INTER_AREA,
+    )
 
 
-# ---------- chạy hàng loạt ----------
-def run_all_images(input_dir, output_dir, params=None):
-    p = {**DEFAULT_PARAMS, **(params or {})}
-    input_dir = Path(input_dir)
-    output_dir = Path(output_dir)
+def process_image(image_path, method):
+    image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if image is None:
+        print(f"Không đọc được ảnh: {image_path}")
+        return False
 
-    files = sorted(f for f in input_dir.iterdir()
-                   if f.is_file() and f.suffix.lower() in IMG_EXT)
-    if not files:
-        raise FileNotFoundError(f"Không có ảnh nào trong {input_dir}")
+    # Khử nhiễu ở kích thước gốc, rồi mới thu nhỏ khi lưu
+    result = resize_if_needed(denoise(image, method))
 
-    rows = []
-    for i, f in enumerate(files, start=1):
-        img = read_image(f)
-        if img is None:
-            print(f"[{i}/{len(files)}] Bỏ qua (không đọc được): {f.name}")
-            continue
+    relative_path = image_path.relative_to(SRC_DIR)
+    save_path = (OUTPUT_DIR / method / relative_path).with_suffix(SAVE_FORMAT)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
 
-        g = gamma_correction(img, p["gamma"])
-        s = percentile_stretch(img, p["low_pct"], p["high_pct"])
-        c = clahe_lab(img, p["clahe_clip"], p["clahe_grid"])
-        full = clahe_lab(
-            percentile_stretch(gamma_correction(img, p["gamma"]),
-                               p["low_pct"], p["high_pct"]),
-            p["clahe_clip"], p["clahe_grid"])
+    if SAVE_FORMAT.lower() in (".jpg", ".jpeg"):
+        params = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+    else:
+        params = [cv2.IMWRITE_PNG_COMPRESSION, PNG_COMPRESSION]
 
-        name = f.stem + ".png"
-        write_image(output_dir / "gamma" / name, g)
-        write_image(output_dir / "stretch" / name, s)
-        write_image(output_dir / "clahe" / name, c)
-        write_image(output_dir / "pipeline" / name, full)
+    if not cv2.imwrite(str(save_path), result, params):
+        print(f"Lỗi lưu ảnh: {save_path}")
+        return False
+    return True
 
-        rows.append({
-            "file": f.name,
-            "brightness_before": round(float(img.mean()), 2),
-            "brightness_gamma": round(float(g.mean()), 2),
-            "brightness_stretch": round(float(s.mean()), 2),
-            "brightness_clahe": round(float(c.mean()), 2),
-            "brightness_pipeline": round(float(full.mean()), 2),
-        })
-        print(f"[{i}/{len(files)}] Xong: {f.name}")
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    with open(output_dir / "summary.csv", "w", newline="", encoding="utf-8-sig") as fh:
-        writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
+# =========================================================
+# 5. TÍNH DUNG LƯỢNG
+# =========================================================
 
-    print(f"\nHoàn thành {len(rows)} ảnh. Kết quả lưu tại: {output_dir.resolve()}")
-    print("Tham số đã dùng:", p)
-    return rows
+def folder_size_mb(folder):
+    folder = Path(folder)
+    if not folder.exists():
+        return 0.0
+    total = sum(p.stat().st_size for p in folder.rglob("*") if p.is_file())
+    return total / (1024 * 1024)
 
-    
+
+# =========================================================
+# 6. CHẠY
+# =========================================================
+
+def main():
+    print("=" * 60)
+    print(f"Ảnh đầu vào: {SRC_DIR}")
+    print(f"Ảnh đầu ra:  {OUTPUT_DIR}")
+    print(f"Định dạng lưu: {SAVE_FORMAT} | JPEG quality: {JPEG_QUALITY} | Cạnh dài tối đa: {MAX_SIDE}")
+    print("=" * 60)
+
+    if not SRC_DIR.is_dir():
+        print("LỖI: Không tìm thấy thư mục results/enhance/pipeline.")
+        return
+
+    image_paths = get_image_paths(SRC_DIR)
+    if not image_paths:
+        print("Không tìm thấy ảnh trong results/enhance/pipeline.")
+        return
+
+    print(f"Tổng số ảnh tìm thấy: {len(image_paths)}")
+    print(f"Dung lượng ảnh đầu vào: {folder_size_mb(SRC_DIR):.1f} MB")
+
+    if RESET_OUTPUT and OUTPUT_DIR.exists():
+        print(f"Đang xóa kết quả cũ: {OUTPUT_DIR}")
+        shutil.rmtree(OUTPUT_DIR)
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    groups = split_among_methods(image_paths)
+
+    print("\nSố ảnh cho từng phương pháp:")
+    for method, paths in groups.items():
+        print(f"  {method}: {len(paths)} ảnh")
+
+    success = {m: 0 for m in METHODS}
+    failed = 0
+
+    for method, paths in groups.items():
+        print(f"\n--- {method} ---")
+        for i, path in enumerate(paths, start=1):
+            if process_image(path, method):
+                success[method] += 1
+                print(f"[{i}/{len(paths)}] {path.name}")
+            else:
+                failed += 1
+
+    total_mb = folder_size_mb(OUTPUT_DIR)
+
+    print("\n" + "=" * 60)
+    print("HOÀN THÀNH")
+    print("=" * 60)
+    for method in METHODS:
+        print(f"{method}: {success[method]} ảnh | {folder_size_mb(OUTPUT_DIR / method):.1f} MB")
+    print(f"Thất bại: {failed}")
+    print(f"Tổng đã xử lý: {sum(success.values())} (mỗi ảnh chỉ 1 bộ lọc, không lặp)")
+    print(f"Tổng dung lượng kết quả: {total_mb:.1f} MB")
+
+    if total_mb > WARN_TOTAL_MB:
+        print(f"\nCẢNH BÁO: Tổng dung lượng vượt {WARN_TOTAL_MB} MB.")
+        print("Hãy giảm JPEG_QUALITY (ví dụ 70) hoặc MAX_SIDE (ví dụ 800) rồi chạy lại.")
+
+
 if __name__ == "__main__":
-    
-
-    ROOT = Path(__file__).resolve().parent.parent   # thư mục gốc project
-    INPUT = ROOT / "data" / "Data"            # thư mục chứa ảnh thiếu sáng
-    OUTPUT = ROOT / "results" / "enhance"           # nơi lưu kết quả
-
-    if not INPUT.exists():
-        print(f"Không thấy thư mục ảnh: {INPUT}")
-        print("Hãy tạo thư mục đó và copy ảnh vào, hoặc sửa dòng INPUT.")
-        sys.exit(1)
-
-    run_all_images(INPUT, OUTPUT)
+    main()
