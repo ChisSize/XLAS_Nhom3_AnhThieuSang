@@ -9,10 +9,7 @@ import cv2
 # 1. CẤU HÌNH
 # =========================================================
 
-BASE_DIR = Path(
-    r"D:\XLAS\XLAS_Nhom3_AnhThieuSang-main"
-    r"\XLAS_Nhom3_AnhThieuSang-main"
-)
+BASE_DIR = Path(__file__).resolve().parent.parent   # thư mục gốc project
 
 SRC_DIR = BASE_DIR / "results" / "enhance" / "pipeline"   # ảnh đầu vào
 OUTPUT_DIR = BASE_DIR / "results" / "denoise"             # kết quả khử nhiễu
@@ -175,10 +172,18 @@ def main():
 
     print(f"Tổng số ảnh tìm thấy: {len(image_paths)}")
     print(f"Dung lượng ảnh đầu vào: {folder_size_mb(SRC_DIR):.1f} MB")
-
+    
     if RESET_OUTPUT and OUTPUT_DIR.exists():
         print(f"Đang xóa kết quả cũ: {OUTPUT_DIR}")
-        shutil.rmtree(OUTPUT_DIR)
+        locked = 0
+        for p in OUTPUT_DIR.rglob("*"):
+            if p.is_file():
+                try:
+                    p.unlink()
+                except PermissionError:
+                    locked += 1
+        if locked:
+            print(f"CẢNH BÁO: {locked} file đang bị khóa, hãy đóng chương trình đang mở chúng.")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
